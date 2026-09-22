@@ -1,6 +1,6 @@
 import os
 import dash
-from dash import dcc, html, dash_table, Input, Output
+from dash import dcc, html, dash_table, Input, Output, State, ctx
 import plotly.express as px
 import pandas as pd
 import numpy as np
@@ -37,9 +37,20 @@ for c in ["latitude", "longitude", "rating"]:
 for c in ["review_count", "checkin_count"]:
     df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
 
+
+def split_subcats(s):
+    """subcategories is stored as a comma-separated string per business."""
+    if pd.isna(s) or not str(s).strip():
+        return []
+    return [x.strip() for x in str(s).split(",") if x.strip()]
+
+
+df["subcat_list"] = df["subcategories"].apply(split_subcats)
+
 CATEGORIES = sorted(df["category"].dropna().unique())
 CITIES = sorted(df["city"].dropna().unique())
 STATES = sorted(df["state"].dropna().unique())
+ALL_SUBCATS = sorted({sc for lst in df["subcat_list"] for sc in lst})
 
 # ── Theme: warm cream & mauve ──
 BG = "#F7F3EF"
@@ -52,15 +63,17 @@ TEXT_LIGHT = "#9B8E9E"
 ACCENT = "#8B6B78"
 HIGHLIGHT_BG = "#F0EAE6"
 
-PALETTE = [
-    "#5B4A5E", "#8B6B78", "#7B6B6E", "#A39296", "#6B5B5E",
-    "#9E8E91", "#8B7B8E", "#C4B8C7", "#7E6E78", "#B8A8AB",
-    "#A69296", "#968690", "#B0A0A8", "#C7B5B9", "#D4C8D7",
-]
+# A broad, highly distinguishable qualitative palette for categorical map colors.
+# (Mixing two qualitative sets gives enough visually separated hues even when
+# there are many categories — same-hue palettes are hard to tell apart on a map.)
+PALETTE = px.colors.qualitative.Alphabet + px.colors.qualitative.Dark24
 CAT_COLORS = {cat: PALETTE[i % len(PALETTE)] for i, cat in enumerate(CATEGORIES)}
 
 SANS = "'Inter', -apple-system, sans-serif"
 SERIF = "'DM Serif Display', serif"
+
+REVIEW_THRESHOLDS = [0, 10, 25, 50, 100, 250, 500, 1000]
+CHECKIN_THRESHOLDS = [0, 10, 25, 50, 100, 250, 500]
 
 
 def kpi_card(label, value, subtitle=""):
@@ -87,6 +100,15 @@ def highlight_card(label, name, detail):
         html.P(detail, style={"color": ACCENT, "fontSize": "12px", "margin": "0", "fontFamily": SANS}),
     ], style={"background": CARD, "border": f"1px solid {BORDER}",
               "borderRadius": "4px", "padding": "16px", "marginBottom": "10px"})
+
+
+def filter_field(label, children):
+    return html.Div(style={"flex": "1", "minWidth": "180px"}, children=[
+        html.Label(label, style={"color": TEXT_MED, "fontSize": "11px",
+                    "display": "block", "marginBottom": "4px",
+                    "textTransform": "uppercase", "letterSpacing": "0.5px", "fontFamily": SANS}),
+        children,
+    ])
 
 
 app = dash.Dash(__name__, title="Blanche Lifestyle Magazine")
@@ -119,6 +141,7 @@ app.index_string = """<!DOCTYPE html>
         .dash-spreadsheet .dash-filter input { background-color: #FFFFFF !important; color: #2D1F30 !important; border-color: #DCD4D9 !important; }
         .previous-next-container button { color: #5B4A5E !important; background: transparent !important; }
         .page-number { color: #2D1F30 !important; }
+        .genie-input::placeholder { color: #9B8E9E; }
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: #F7F3EF; }
         ::-webkit-scrollbar-thumb { background: #DCD4D9; border-radius: 3px; }
@@ -162,48 +185,116 @@ app.layout = html.Div(
                 html.Div(id="highlights-panel"),
             ]),
         ]),
+        # ── Ask Genie (placeholder) ──
+        html.Div(style={"padding": "0 40px 20px"}, children=[
+            html.P("ASK GENIE", style={"color": TEXT_LIGHT, "fontSize": "11px",
+                    "letterSpacing": "1.5px", "marginBottom": "8px"}),
+            html.Div(style={"background": CARD, "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                             "padding": "18px 20px"}, children=[
+                html.Div(style={"display": "flex", "gap": "10px", "alignItems": "center"}, children=[
+                    dcc.Input(
+                        id="genie-input",
+                        type="text",
+                        placeholder="Ask a question about this data in plain English \u2014 e.g. \u201cWhich category has the highest average rating in Austin?\u201d",
+                        className="genie-input",
+                        style={"flex": "1", "padding": "10px 14px", "borderRadius": "2px",
+                               "border": f"1px solid {BORDER}", "fontFamily": SANS,
+                               "fontSize": "13px", "color": TEXT_DARK, "background": CARD},
+                    ),
+                    html.Button("Ask Genie", id="genie-ask-btn", n_clicks=0, style={
+                        "background": PRIMARY, "color": "white", "border": "none",
+                        "borderRadius": "2px", "padding": "10px 20px", "fontFamily": SANS,
+                        "fontSize": "13px", "fontWeight": "600", "cursor": "pointer",
+                        "whiteSpace": "nowrap",
+                    }),
+                ]),
+                html.Div(id="genie-output", style={
+                    "marginTop": "12px", "fontSize": "12px", "color": TEXT_LIGHT,
+                    "fontFamily": SANS, "fontStyle": "italic",
+                }),
+            ]),
+        ]),
         # ── Directory filters + table ──
         html.Div(style={"padding": "0 40px 40px"}, children=[
             html.P("DIRECTORY", style={"color": TEXT_LIGHT, "fontSize": "11px",
                     "letterSpacing": "1.5px", "marginBottom": "12px"}),
+            html.Div(style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "10px"}, children=[
+                filter_field("Category", dcc.Dropdown(
+                    id="filter-category",
+                    options=[{"label": c, "value": c} for c in CATEGORIES],
+                    multi=True, placeholder="All")),
+                filter_field("Subcategory", dcc.Dropdown(
+                    id="filter-subcategory",
+                    options=[{"label": s, "value": s} for s in ALL_SUBCATS],
+                    multi=True, placeholder="All")),
+                filter_field("City", dcc.Dropdown(
+                    id="filter-city",
+                    options=[{"label": c, "value": c} for c in CITIES],
+                    multi=True, placeholder="All")),
+                filter_field("State", dcc.Dropdown(
+                    id="filter-state",
+                    options=[{"label": s, "value": s} for s in STATES],
+                    multi=True, placeholder="All")),
+            ]),
             html.Div(style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "16px"}, children=[
-                html.Div(style={"flex": "1", "minWidth": "180px"}, children=[
-                    html.Label("Category", style={"color": TEXT_MED, "fontSize": "11px",
-                                "display": "block", "marginBottom": "4px",
-                                "textTransform": "uppercase", "letterSpacing": "0.5px"}),
-                    dcc.Dropdown(id="filter-category",
-                                 options=[{"label": c, "value": c} for c in CATEGORIES],
-                                 multi=True, placeholder="All"),
-                ]),
-                html.Div(style={"flex": "1", "minWidth": "180px"}, children=[
-                    html.Label("City", style={"color": TEXT_MED, "fontSize": "11px",
-                                "display": "block", "marginBottom": "4px",
-                                "textTransform": "uppercase", "letterSpacing": "0.5px"}),
-                    dcc.Dropdown(id="filter-city",
-                                 options=[{"label": c, "value": c} for c in CITIES],
-                                 multi=True, placeholder="All"),
-                ]),
-                html.Div(style={"flex": "1", "minWidth": "180px"}, children=[
-                    html.Label("State", style={"color": TEXT_MED, "fontSize": "11px",
-                                "display": "block", "marginBottom": "4px",
-                                "textTransform": "uppercase", "letterSpacing": "0.5px"}),
-                    dcc.Dropdown(id="filter-state",
-                                 options=[{"label": s, "value": s} for s in STATES],
-                                 multi=True, placeholder="All"),
-                ]),
-                html.Div(style={"flex": "1", "minWidth": "140px"}, children=[
-                    html.Label("Min Rating", style={"color": TEXT_MED, "fontSize": "11px",
-                                "display": "block", "marginBottom": "4px",
-                                "textTransform": "uppercase", "letterSpacing": "0.5px"}),
-                    dcc.Dropdown(id="filter-rating",
-                                 options=[{"label": f"{r}+", "value": r} for r in [1, 2, 2.5, 3, 3.5, 4, 4.5]],
-                                 value=1, clearable=False),
-                ]),
+                filter_field("Min Rating", dcc.Dropdown(
+                    id="filter-rating",
+                    options=[{"label": f"{r}+ \u2605", "value": r} for r in [1, 2, 2.5, 3, 3.5, 4, 4.5]],
+                    value=1, clearable=False)),
+                filter_field("Min Reviews", dcc.Dropdown(
+                    id="filter-min-reviews",
+                    options=[{"label": f"{r:,}+", "value": r} for r in REVIEW_THRESHOLDS],
+                    value=0, clearable=False)),
+                filter_field("Min Check-ins", dcc.Dropdown(
+                    id="filter-min-checkins",
+                    options=[{"label": f"{r:,}+", "value": r} for r in CHECKIN_THRESHOLDS],
+                    value=0, clearable=False)),
+                filter_field("Search Name", dcc.Input(
+                    id="filter-search",
+                    type="text",
+                    placeholder="Business name contains\u2026",
+                    style={"width": "100%", "padding": "8px 10px", "borderRadius": "2px",
+                           "border": f"1px solid {BORDER}", "fontFamily": SANS,
+                           "fontSize": "13px", "color": TEXT_DARK, "background": CARD,
+                           "boxSizing": "border-box"})),
             ]),
             html.Div(id="data-table-container"),
         ]),
     ],
 )
+
+
+# ── Cascading subcategory options based on selected categories ──
+@app.callback(
+    Output("filter-subcategory", "options"),
+    Input("filter-category", "value"),
+)
+def update_subcategory_options(categories):
+    if categories:
+        subs = set()
+        for lst in df.loc[df["category"].isin(categories), "subcat_list"]:
+            subs.update(lst)
+        opts = sorted(subs)
+    else:
+        opts = ALL_SUBCATS
+    return [{"label": s, "value": s} for s in opts]
+
+
+# ── Genie placeholder callback ──
+@app.callback(
+    Output("genie-output", "children"),
+    Input("genie-ask-btn", "n_clicks"),
+    State("genie-input", "value"),
+    prevent_initial_call=True,
+)
+def ask_genie(n_clicks, question):
+    if not question or not question.strip():
+        return "Enter a question above, then click \u201cAsk Genie.\u201d"
+    return (
+        "Genie integration coming soon \u2014 this will route natural-language questions "
+        "like yours to a Databricks Genie space over the genieology.gold.business table "
+        "and return an answer here."
+    )
 
 
 @app.callback(
@@ -212,20 +303,35 @@ app.layout = html.Div(
     Output("highlights-panel", "children"),
     Output("data-table-container", "children"),
     Input("filter-category", "value"),
+    Input("filter-subcategory", "value"),
     Input("filter-city", "value"),
     Input("filter-state", "value"),
     Input("filter-rating", "value"),
+    Input("filter-min-reviews", "value"),
+    Input("filter-min-checkins", "value"),
+    Input("filter-search", "value"),
 )
-def update_dashboard(categories, cities, states, min_rating):
+def update_dashboard(categories, subcategories, cities, states, min_rating,
+                      min_reviews, min_checkins, search_text):
     filtered = df.copy()
     if categories:
         filtered = filtered[filtered["category"].isin(categories)]
+    if subcategories:
+        filtered = filtered[filtered["subcat_list"].apply(
+            lambda lst: any(sc in lst for sc in subcategories))]
     if cities:
         filtered = filtered[filtered["city"].isin(cities)]
     if states:
         filtered = filtered[filtered["state"].isin(states)]
     if min_rating and min_rating > 1:
         filtered = filtered[filtered["rating"] >= min_rating]
+    if min_reviews:
+        filtered = filtered[filtered["review_count"] >= min_reviews]
+    if min_checkins:
+        filtered = filtered[filtered["checkin_count"] >= min_checkins]
+    if search_text and search_text.strip():
+        filtered = filtered[filtered["business_name"].str.contains(
+            search_text.strip(), case=False, na=False)]
 
     n = len(filtered)
     avg_r = filtered["rating"].mean() if n else 0
@@ -242,9 +348,13 @@ def update_dashboard(categories, cities, states, min_rating):
     map_df = filtered.dropna(subset=["latitude", "longitude"]).copy()
     if len(map_df) > 0:
         map_df["_size"] = np.sqrt(map_df["review_count"].fillna(0).clip(lower=1)) + 2
+        # Order categories by frequency so the legend lists the most common first,
+        # and only the categories actually present are shown (a cleaner key).
+        cat_order = (map_df["category"].value_counts().index.tolist())
         fig = px.scatter_mapbox(
             map_df, lat="latitude", lon="longitude",
             color="category", color_discrete_map=CAT_COLORS,
+            category_orders={"category": cat_order},
             hover_name="business_name",
             hover_data={"rating": ":.1f", "review_count": ":,", "city": True,
                         "category": True, "latitude": False, "longitude": False, "_size": False},
@@ -252,10 +362,19 @@ def update_dashboard(categories, cities, states, min_rating):
             mapbox_style="open-street-map",
         )
         fig.update_layout(
-            margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor=CARD,
-            legend=dict(bgcolor="rgba(255,255,255,0.92)", font=dict(color=TEXT_DARK, size=10, family="Inter"),
-                        bordercolor=BORDER, borderwidth=1,
-                        orientation="h", yanchor="top", y=-0.02, xanchor="center", x=0.5),
+            margin=dict(l=0, r=170, t=0, b=0), paper_bgcolor=CARD,
+            legend=dict(
+                orientation="v",
+                yanchor="top", y=0.98,
+                xanchor="left", x=1.01,
+                bgcolor="rgba(255,255,255,0.95)",
+                bordercolor=BORDER, borderwidth=1,
+                font=dict(color=TEXT_DARK, size=10, family="Inter"),
+                title=dict(text="Category", font=dict(color=TEXT_MED, size=10, family="Inter")),
+                itemsizing="constant",
+                itemwidth=30,
+                tracegroupgap=2,
+            ),
             mapbox_center=dict(lat=map_df["latitude"].mean(), lon=map_df["longitude"].mean()),
         )
     else:
